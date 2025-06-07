@@ -8,12 +8,14 @@ import base64
 import requests
 import os
 from dotenv import load_dotenv
+from langchain_community.tools import WikipediaQueryRun
+from langchain_community.utilities import WikipediaAPIWrapper
 
 load_dotenv()
 search_tool = DuckDuckGoSearchRun()  # Instantiate once
 
 # Get API key from environment variable
-openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_api_key = os.getenv("gpt")
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set")
 
@@ -128,15 +130,15 @@ def image_search(query: str, max_results: int = 10) -> str:
 
 vision_llm = ChatOpenAI(temperature=0.3, model="gpt-4o-mini", api_key=openai_api_key, verbose=True)
 
-def extract_text_from_image(img_path_or_url: str) -> str:
+def explain_image(img_path_or_url: str) -> str:
     """
-    Extract text from an image file or URL using a multimodal model.
+    Explain what you understand from the image file or URL using a multimodal model.
     
     Args:
         img_path_or_url: Either a local file path or a URL to an image
     
     Returns:
-        Extracted text from the image
+        Explanation of the image content
     """
     all_text = ""
     try:
@@ -160,8 +162,8 @@ def extract_text_from_image(img_path_or_url: str) -> str:
                     {
                         "type": "text",
                         "text": (
-                            "Extract all the text from this image. "
-                            "Return only the extracted text, no explanations."
+                            "Explain what you see in the image. "
+                            "Return only a short answer, no explanations."
                         ),
                     },
                     {
@@ -177,11 +179,34 @@ def extract_text_from_image(img_path_or_url: str) -> str:
         # Call the vision-capable model
         response = vision_llm.invoke(message)
 
-        # Append extracted text
-        all_text += response.content + "\n\n"
-
-        return all_text.strip()
+        return response.content
     except Exception as e:
         error_msg = f"Error extracting text: {str(e)}"
         print(error_msg)
         return ""
+
+# Initialize Wikipedia API wrapper
+wikipedia = WikipediaAPIWrapper()
+
+@tool
+def wikipedia_search(query: str) -> str:
+    """Search Wikipedia for information about a topic.
+    
+    Args:
+        query: The search query for Wikipedia
+    
+    Returns:
+        Wikipedia article content or search results
+    """
+    try:
+        # Use the WikipediaQueryRun tool with the wrapper
+        wiki_tool = WikipediaQueryRun(api_wrapper=wikipedia)
+        result = wiki_tool.run(query)
+        
+        if result:
+            return result
+        else:
+            return f"No Wikipedia results found for '{query}'"
+            
+    except Exception as e:
+        return f"Wikipedia search failed: {str(e)}"

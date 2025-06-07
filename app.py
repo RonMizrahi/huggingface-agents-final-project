@@ -1,83 +1,206 @@
 import os
-from langchain_openai import ChatOpenAI
-from typing import TypedDict, Annotated
-from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, SystemMessage
-from langgraph.prebuilt import ToolNode
-from langgraph.graph import START, StateGraph
-from langgraph.prebuilt import tools_condition
-from tools import extract_text_from_image, web_search_with_images
-from dotenv import load_dotenv
+from agent import build_graph
+import gradio as gr
+import requests
+import inspect
+import pandas as pd
+from langchain_core.messages import HumanMessage
+import re
 
-load_dotenv()
+# (Keep Constants as is)
+# --- Constants ---
+DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 
-# Get API key from environment variable
-openai_api_key = os.getenv("OPENAI_API_KEY")
-if not openai_api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
+# --- Basic Agent Definition ---
+# ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
+class BasicAgent:
+    def __init__(self):
+        print("BasicAgent initialized.")
+        self.graph = build_graph()
+    def __call__(self, question: str) -> str:
+        print(f"Agent received question (first 50 chars): {question[:50]}...")
+        # Wrap the question in a HumanMessage from langchain_core
+        messages = [HumanMessage(content=question)]
+        messages = self.graph.invoke({"messages": messages})
+        answer = messages['messages'][-1].content
+        return answer[14:]
 
-llm = ChatOpenAI(temperature=0.3, model="gpt-4o-mini", api_key=openai_api_key, verbose=True)
-tools = [extract_text_from_image, web_search_with_images]
-chat_with_tools = llm.bind_tools(tools)
+def run_and_submit_all( profile: gr.OAuthProfile | None):
+    """
+    Fetches all questions, runs the BasicAgent on them, submits all answers,
+    and displays the results.
+    """
+    # --- Determine HF Space Runtime URL and Repo URL ---
+    space_id = os.getenv("SPACE_ID") # Get the SPACE_ID for sending link to the code
 
-# Generate the AgentState and Agent graph
-class AgentState(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
+    if profile:
+        username= f"{profile.username}"
+        print(f"User logged in: {username}")
+    else:
+        print("User not logged in.")
+        return "Please Login to Hugging Face with the button.", None
 
-def assistant(state: AgentState):
-    return {
-        "messages": [chat_with_tools.invoke(state["messages"])],
-    }
+    api_url = DEFAULT_API_URL
+    questions_url = f"{api_url}/questions"
+    submit_url = f"{api_url}/submit"
+
+    # 1. Instantiate Agent ( modify this part to create your agent)
+    try:
+        agent = BasicAgent()
+    except Exception as e:
+        print(f"Error instantiating agent: {e}")
+        return f"Error initializing agent: {e}", None
+    # In the case of an app running as a hugging Face space, this link points toward your codebase ( usefull for others so please keep it public)
+    agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
+    print(agent_code)
+
+    # 2. Fetch Questions
+    print(f"Fetching questions from: {questions_url}")
+    try:
+        response = requests.get(questions_url, timeout=15)
+        response.raise_for_status()
+        questions_data = response.json()
+        if not questions_data:
+             print("Fetched questions list is empty.")
+             return "Fetched questions list is empty or invalid format.", None
+        print(f"Fetched {len(questions_data)} questions.")
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching questions: {e}")
+        return f"Error fetching questions: {e}", None
+    except requests.exceptions.JSONDecodeError as e:
+         print(f"Error decoding JSON response from questions endpoint: {e}")
+         print(f"Response text: {response.text[:500]}")
+         return f"Error decoding server response for questions: {e}", None
+    except Exception as e:
+        print(f"An unexpected error occurred fetching questions: {e}")
+        return f"An unexpected error occurred fetching questions: {e}", None
+
+    # 3. Run your Agent
+    results_log = []
+    answers_payload = []
+    print(f"Running agent on {len(questions_data)} questions...")
+    for item in questions_data:
+        task_id = item.get("task_id")
+        question_text = item.get("question")
+        if not task_id or question_text is None:
+            print(f"Skipping item with missing task_id or question: {item}")
+            continue
+        try:
+            submitted_answer = agent(question_text)
+            match = re.search(r'FINAL ANSWER:\s*(.*)', submitted_answer)
+            if match:
+                submitted_answer = match.group(1)
+                print(submitted_answer)  # Output: 3
+            answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
+            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
+        except Exception as e:
+             print(f"Error running agent on task {task_id}: {e}")
+             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+
+    if not answers_payload:
+        print("Agent did not produce any answers to submit.")
+        return "Agent did not produce any answers to submit.", pd.DataFrame(results_log)
+
+    # 4. Prepare Submission 
+    submission_data = {"username": username.strip(), "agent_code": agent_code, "answers": answers_payload}
+    status_update = f"Agent finished. Submitting {len(answers_payload)} answers for user '{username}'..."
+    print(status_update)
+
+    # 5. Submit
+    print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
+    try:
+        response = requests.post(submit_url, json=submission_data, timeout=60)
+        response.raise_for_status()
+        result_data = response.json()
+        final_status = (
+            f"Submission Successful!\n"
+            f"User: {result_data.get('username')}\n"
+            f"Overall Score: {result_data.get('score', 'N/A')}% "
+            f"({result_data.get('correct_count', '?')}/{result_data.get('total_attempted', '?')} correct)\n"
+            f"Message: {result_data.get('message', 'No message received.')}"
+        )
+        print("Submission successful.")
+        results_df = pd.DataFrame(results_log)
+        return final_status, results_df
+    except requests.exceptions.HTTPError as e:
+        error_detail = f"Server responded with status {e.response.status_code}."
+        try:
+            error_json = e.response.json()
+            error_detail += f" Detail: {error_json.get('detail', e.response.text)}"
+        except requests.exceptions.JSONDecodeError:
+            error_detail += f" Response: {e.response.text[:500]}"
+        status_message = f"Submission Failed: {error_detail}"
+        print(status_message)
+        results_df = pd.DataFrame(results_log)
+        return status_message, results_df
+    except requests.exceptions.Timeout:
+        status_message = "Submission Failed: The request timed out."
+        print(status_message)
+        results_df = pd.DataFrame(results_log)
+        return status_message, results_df
+    except requests.exceptions.RequestException as e:
+        status_message = f"Submission Failed: Network error - {e}"
+        print(status_message)
+        results_df = pd.DataFrame(results_log)
+        return status_message, results_df
+    except Exception as e:
+        status_message = f"An unexpected error occurred during submission: {e}"
+        print(status_message)
+        results_df = pd.DataFrame(results_log)
+        return status_message, results_df
 
 
-## The graph
-builder = StateGraph(AgentState)
+# --- Build Gradio Interface using Blocks ---
+with gr.Blocks() as demo:
+    gr.Markdown("# Basic Agent Evaluation Runner")
+    gr.Markdown(
+        """
+        **Instructions:**
 
-# Define nodes: these do the work
-builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode(tools))
+        1.  Please clone this space, then modify the code to define your agent's logic, the tools, the necessary packages, etc ...
+        2.  Log in to your Hugging Face account using the button below. This uses your HF username for submission.
+        3.  Click 'Run Evaluation & Submit All Answers' to fetch questions, run your agent, submit answers, and see the score.
 
-# Define edges: these determine how the control flow moves
-builder.add_edge(START, "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    # If the latest message requires a tool, route to tools
-    # Otherwise, provide a direct response
-    tools_condition,
-)
-builder.add_edge("tools", "assistant")
-alfred = builder.compile()
- # Add a system prompt to every conversation
-system_prompt = SystemMessage(content="""
-You are an expert AI assistant designed to answer complex questions with accuracy, clarity, and depth. 
-You have access to advanced tools, including web search and image analysis, 
-to help you gather and synthesize information. Always reason step by step, 
-cite your sources when possible, and ensure your answers are factual and well-explained. 
-If you do not know the answer, state so honestly. 
-Your goal is to provide responses that would pass rigorous evaluation for correctness and reasoning, 
-such as the GAIA test.
+        ---
+        **Disclaimers:**
+        Once clicking on the "submit button, it can take quite some time ( this is the time for the agent to go through all the questions).
+        This space provides a basic setup and is intentionally sub-optimal to encourage you to develop your own, more robust solution. For instance for the delay process of the submit button, a solution could be to cache the answers and submit in a seperate action or even to answer the questions in async.
+        """
+    )
 
-[Calling tools]
-IMPORTANT: Before calling any tool, you MUST first explain in plain text:
-1. Which tool you are about to use
-2. What arguments you are passing to it
-3. Why you are using this tool
+    gr.LoginButton()
 
-Example format:
-"I will now use the web_searchweb_search_with_images tool with the argument 'Lady Ada Lovelace' to gather information about this person."
-Tool Output:
-continue conversation
-[Calling tools]
+    run_button = gr.Button("Run Evaluation & Submit All Answers")
 
-""")
+    status_output = gr.Textbox(label="Run Status / Submission Result", lines=5, interactive=False)
+    # Removed max_rows=10 from DataFrame constructor
+    results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
 
+    run_button.click(
+        fn=run_and_submit_all,
+        outputs=[status_output, results_table]
+    )
 
-response = alfred.invoke({"messages": [system_prompt,HumanMessage(content="Which of the fruits shown in the 2008 painting “Embroidery from Uzbekistan” were served as part of the October 1949 breakfast menu for the ocean liner that was later used as a floating prop for the film “The Last Voyage”? Give the items as a comma-separated list, ordering them in clockwise order based on their arrangement in the painting starting from the 12 o’clock position. Use the plural form of each fruit.")]})
+if __name__ == "__main__":
+    print("\n" + "-"*30 + " App Starting " + "-"*30)
+    # Check for SPACE_HOST and SPACE_ID at startup for information
+    space_host_startup = os.getenv("SPACE_HOST")
+    space_id_startup = os.getenv("SPACE_ID") # Get SPACE_ID at startup
 
-print("🎩 Alfred's Conversation:")
-for i, msg in enumerate(response['messages']):
-    role = getattr(msg, 'type', None) or msg.__class__.__name__
-    print(f"[{i}] {role}: {getattr(msg, 'content', msg)}\n")
+    if space_host_startup:
+        print(f"✅ SPACE_HOST found: {space_host_startup}")
+        print(f"   Runtime URL should be: https://{space_host_startup}.hf.space")
+    else:
+        print("ℹ️  SPACE_HOST environment variable not found (running locally?).")
 
-#alfred.get_graph(xray=True).draw_mermaid_png(output_file_path="rag.png")
+    if space_id_startup: # Print repo URLs if SPACE_ID is found
+        print(f"✅ SPACE_ID found: {space_id_startup}")
+        print(f"   Repo URL: https://huggingface.co/spaces/{space_id_startup}")
+        print(f"   Repo Tree URL: https://huggingface.co/spaces/{space_id_startup}/tree/main")
+    else:
+        print("ℹ️  SPACE_ID environment variable not found (running locally?). Repo URL cannot be determined.")
 
+    print("-"*(60 + len(" App Starting ")) + "\n")
+
+    print("Launching Gradio Interface for Basic Agent Evaluation...")
+    demo.launch(debug=True, share=False)
